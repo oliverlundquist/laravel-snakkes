@@ -2,6 +2,8 @@
 
 namespace App\WebSocket\Server;
 
+use App\Snakkes\Engine;
+use App\Snakkes\GameHandler;
 use App\WebSocket\Connection\ConnectionHandler;
 use App\WebSocket\Gateway\DataTransformer;
 use App\WebSocket\Gateway\FrameFactory;
@@ -66,6 +68,20 @@ class StartServerCommand extends Command
     protected $transceiver;
 
     /**
+     * Variable that holds a game handler instance.
+     *
+     * @var GameHandler
+     */
+    protected $gameHandler;
+
+    /**
+     * Variable that holds a game engine instance.
+     *
+     * @var Engine
+     */
+    protected $gameEngine;
+
+    /**
      * Execute the console command.
      */
     public function handle(): void
@@ -74,6 +90,8 @@ class StartServerCommand extends Command
         $this->connectionHandler   = new ConnectionHandler;
         $this->messageQueueHandler = new MessageQueueHandler;
         $this->transceiver         = new Transceiver;
+        $this->gameHandler         = new GameHandler;
+        $this->gameEngine          = new Engine;
 
         $server = $this->webSocketServer->startServer();
 
@@ -90,6 +108,9 @@ class StartServerCommand extends Command
 
             // 4. read sockets looking for new queued message
             $this->readDataFromAllConnections();
+
+            // 5. send game events
+            $this->transmitGameEvents();
         }
     }
 
@@ -152,6 +173,7 @@ class StartServerCommand extends Command
                 continue;
             }
             $this->respondToControlFrames($webSocketFrame, $connectionId);
+            $this->respondToDirectEvents($webSocketFrame, $connectionId);
             $this->queueTextMessage($webSocketFrame, $connectionId);
             $this->connectionHandler->pingConnectionId($connectionId);
         }
@@ -174,6 +196,47 @@ class StartServerCommand extends Command
     }
 
     /**
+     * @param UUIDv4String $connectionId
+     */
+    private function respondToDirectEvents(WebSocketFrame $webSocketFrame, string $connectionId): void
+    {
+        if ($webSocketFrame->frameType !== FrameType::TEXT) {
+            return;
+        }
+        if (is_null($webSocketFrame->jsonDecodedPayload)) {
+            return;
+        }
+        /** @var object{event: string, message: GameDifficultyString|WormDirectionString} $jsonDecodedPayload */
+        $jsonDecodedPayload = $webSocketFrame->jsonDecodedPayload;
+        //
+        // Start Game Event
+        //
+        if ($jsonDecodedPayload->event === 'start_game') {
+            /** @var object{event: string, message: GameDifficultyString} $jsonDecodedPayload */
+            $jsonDecodedPayload = $webSocketFrame->jsonDecodedPayload;
+            $this->gameHandler->startNewGame($connectionId, $jsonDecodedPayload->message);
+        }
+        //
+        // Direction Change Event
+        //
+        if ($jsonDecodedPayload->event === 'direction_change') {
+            /** @var object{event: string, message: WormDirectionString} $jsonDecodedPayload */
+            $jsonDecodedPayload = $webSocketFrame->jsonDecodedPayload;
+            $game = $this->gameHandler->getGame($connectionId);
+            if (is_null($game)) {
+                return;
+            }
+            $game->worm1->direction = $jsonDecodedPayload->message;
+        }
+        //
+        // Ping Event
+        //
+        if ($jsonDecodedPayload->event === 'ping') {
+            $this->transmit($connectionId, new MessageFactory()->pongMessage($connectionId));
+        }
+    }
+
+    /**
      * @param ?UUIDv4String $connectionId
      */
     private function queueTextMessage(WebSocketFrame $webSocketFrame, ?string $connectionId = null): void
@@ -186,6 +249,7 @@ class StartServerCommand extends Command
         }
         /** @var object{event: string, destination: object{instance_name: string, connection_id: UUIDv4String}} $jsonDecodedPayload */
         $jsonDecodedPayload = $webSocketFrame->jsonDecodedPayload;
+
         //
         // Broadcast Events
         //
@@ -204,11 +268,26 @@ class StartServerCommand extends Command
             $connectionId = $jsonDecodedPayload->destination->connection_id;
             $this->messageQueueHandler->queueForConnectionId($instanceName, $connectionId, $webSocketFrame->payload);
         }
-        //
-        // Ping Event
-        //
-        if ($jsonDecodedPayload->event === 'ping') {
-            $this->transmit($connectionId, new MessageFactory()->pongMessage($connectionId));
+    }
+
+    private function transmitGameEvents(): void
+    {
+        // add sleep to keep down the game speed
+        usleep(80000); // 80ms
+
+        $games = $this->gameHandler->getAllGames();
+
+        foreach ($games as $connectionId => $game) {
+            if ($this->gameHandler->gameIsFinished($game)) {
+                $this->gameHandler->removeGame($connectionId);
+                continue;
+            }
+            $this->gameEngine->process($game);
+            $gameData = json_encode(array_replace($this->gameHandler->getGameState($game), ['event' => 'game_data']));
+            if ($gameData === false) {
+                return;
+            }
+            $this->transmitToConnection($connectionId, $gameData);
         }
     }
 
